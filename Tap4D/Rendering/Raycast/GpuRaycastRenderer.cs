@@ -6,9 +6,10 @@ using Tap4D.Scene;
 namespace Tap4D.Rendering.Raycast;
 
 /// <summary>
-/// GPU raycasting renderer: pass 1 (<see cref="RaycastVoxelShader"/>) casts one ray per voxel
-/// of the spherical virtual screen into the voxel buffer, pass 2 (<see cref="CompositeShader"/>)
-/// composites each real pixel by alternating the hit slices in ana-kata order across frames.
+/// GPU raycasting renderer: pass 1 (<see cref="RaycastVoxelShader"/>) casts the rays of
+/// every voxel of the spherical virtual screen over the screen-tiling candidate lists
+/// into the voxel buffer, pass 2 (<see cref="CompositeShader"/>) composites each real
+/// pixel by alternating the hit slices in ana-kata order across frames.
 /// Buffers are reused across frames.
 /// </summary>
 /// <remarks>
@@ -21,6 +22,8 @@ namespace Tap4D.Rendering.Raycast;
 /// <param name="maxFps">The frame rate limit; zero means no limit.</param>
 public class GpuRaycastRenderer(int width, int height, int slices = 64, int subRays = 1, int maxFps = 0) : IRenderer, IDisposable
 {
+    private const float CullMargin = 1e-4f;
+
     private readonly GraphicsDevice _device = GraphicsDevice.GetDefault();
     private readonly double _minFrameMs = maxFps > 0 ? 1000.0 / maxFps : 0;
     private readonly Stopwatch _throttleWatch = Stopwatch.StartNew();
@@ -28,14 +31,17 @@ public class GpuRaycastRenderer(int width, int height, int slices = 64, int subR
     private ReadOnlyBuffer<GpuTetrahedron>? _visibleBuffer;
     private ReadOnlyBuffer<GpuTetrahedron>? _occluderBuffer;
     private ReadOnlyBuffer<GpuSegment>? _segmentBuffer;
+    private ReadOnlyBuffer<int>? _visibleOffsetsBuffer;
+    private ReadOnlyBuffer<int>? _visibleIndicesBuffer;
+    private ReadOnlyBuffer<int>? _occluderOffsetsBuffer;
+    private ReadOnlyBuffer<int>? _occluderIndicesBuffer;
+    private ReadOnlyBuffer<int>? _segmentOffsetsBuffer;
+    private ReadOnlyBuffer<int>? _segmentIndicesBuffer;
     private ReadWriteBuffer<float>? _depths;
     private ReadWriteBuffer<float>? _coverage;
     private ReadWriteBuffer<int>? _output;
     private int[]? _readback;
     private byte[]? _frame;
-    private int _visibleCount;
-    private int _occluderCount;
-    private int _segmentCount;
 
 
     /// <summary>The image width in pixels.</summary>
@@ -83,8 +89,17 @@ public class GpuRaycastRenderer(int width, int height, int slices = 64, int subR
             return _frame;
         _lastRenderMs = now;
         CameraSpaceGeometry.TransformOnly(scene, camera, out List<Tetrahedron> visible, out List<Tetrahedron> occluders, out List<Segment4> segments);
+        AngularRanges[] visibleRanges = [.. visible.Select(t => AngularRanges.Compute(t, camera.Focal))];
+        AngularRanges[] occluderRanges = [.. occluders.Select(t => AngularRanges.Compute(t, camera.Focal))];
+        AngularRanges[] segmentRanges = [.. segments.Select(s => AngularRanges.ComputeWithRadius(s, camera.Focal))];
+        float pixelSize = ViewHeight / Height;
+        float sliceWidth = (MaxW - MinW) / SliceCount;
+        ScreenTiling tiling = ScreenTiling.Build(Width, Height, pixelSize,
+            0.5f * pixelSize + CullMargin, 1.5f * pixelSize + 0.5f * sliceWidth * SegmentWScale + CullMargin,
+            visibleRanges, occluderRanges, segmentRanges);
         EnsureFrameBuffers();
-        UploadGeometry(visible, occluders, segments, camera.Focal);
+        UploadGeometry(visible, occluders, segments, visibleRanges, occluderRanges, segmentRanges);
+        UploadTiling(tiling);
         DispatchVoxelPass(camera);
         DispatchCompositePass(camera);
         _output!.CopyTo(_readback!);
@@ -101,29 +116,58 @@ public class GpuRaycastRenderer(int width, int height, int slices = 64, int subR
         _visibleBuffer?.Dispose();
         _occluderBuffer?.Dispose();
         _segmentBuffer?.Dispose();
+        _visibleOffsetsBuffer?.Dispose();
+        _visibleIndicesBuffer?.Dispose();
+        _occluderOffsetsBuffer?.Dispose();
+        _occluderIndicesBuffer?.Dispose();
+        _segmentOffsetsBuffer?.Dispose();
+        _segmentIndicesBuffer?.Dispose();
         _depths?.Dispose();
         _coverage?.Dispose();
         _output?.Dispose();
     }
 
     /// <summary>
-    /// Uploads the camera-space geometry (with angular bounds for slice culling)
+    /// Uploads the camera-space geometry (with angular ana-kata bounds for slice culling)
     /// into persistent GPU buffers, growing them when needed.
     /// </summary>
-    private void UploadGeometry(List<Tetrahedron> visible, List<Tetrahedron> occluders, List<Segment4> segments, float focal)
+    private void UploadGeometry(List<Tetrahedron> visible, List<Tetrahedron> occluders, List<Segment4> segments,
+        AngularRanges[] visibleRanges, AngularRanges[] occluderRanges, AngularRanges[] segmentRanges)
     {
-        _visibleCount = visible.Count;
-        _occluderCount = occluders.Count;
-        _segmentCount = segments.Count;
         GpuBuffers.EnsureCapacity(_device, ref _visibleBuffer, visible.Count);
         GpuBuffers.EnsureCapacity(_device, ref _occluderBuffer, occluders.Count);
         GpuBuffers.EnsureCapacity(_device, ref _segmentBuffer, segments.Count);
         if (visible.Count > 0)
-            _visibleBuffer!.CopyFrom(ToGpu(visible, focal));
+            _visibleBuffer!.CopyFrom(ToGpu(visible, visibleRanges));
         if (occluders.Count > 0)
-            _occluderBuffer!.CopyFrom(ToGpu(occluders, focal));
+            _occluderBuffer!.CopyFrom(ToGpu(occluders, occluderRanges));
         if (segments.Count > 0)
-            _segmentBuffer!.CopyFrom(ToGpu(segments, focal));
+            _segmentBuffer!.CopyFrom(ToGpu(segments, segmentRanges));
+    }
+
+    /// <summary>
+    /// Uploads the screen tiling candidate lists into persistent GPU buffers.
+    /// </summary>
+    private void UploadTiling(ScreenTiling tiling)
+    {
+        UploadIntBuffer(ref _visibleOffsetsBuffer, tiling.VisibleOffsets);
+        UploadIntBuffer(ref _visibleIndicesBuffer, tiling.VisibleIndices);
+        UploadIntBuffer(ref _occluderOffsetsBuffer, tiling.OccluderOffsets);
+        UploadIntBuffer(ref _occluderIndicesBuffer, tiling.OccluderIndices);
+        UploadIntBuffer(ref _segmentOffsetsBuffer, tiling.SegmentOffsets);
+        UploadIntBuffer(ref _segmentIndicesBuffer, tiling.SegmentIndices);
+    }
+
+    /// <summary>
+    /// Uploads one int array into a persistent GPU buffer, growing it when needed.
+    /// Empty arrays are skipped: zero-length uploads are invalid, and the offsets
+    /// guarantee the buffer is never read in that case.
+    /// </summary>
+    private void UploadIntBuffer(ref ReadOnlyBuffer<int>? buffer, int[] data)
+    {
+        GpuBuffers.EnsureCapacity(_device, ref buffer, data.Length);
+        if (data.Length > 0)
+            buffer!.CopyFrom(data);
     }
 
     /// <summary>
@@ -147,8 +191,11 @@ public class GpuRaycastRenderer(int width, int height, int slices = 64, int subR
         float footprintK = (ViewHeight / Height + 0.5f * sliceWidth * SegmentWScale) / camera.Focal;
         RaycastVoxelShader voxelShader = new(
             _visibleBuffer!, _occluderBuffer!, _segmentBuffer!, _depths!, _coverage!,
-            _visibleCount, _occluderCount, _segmentCount,
+            _visibleOffsetsBuffer!, _visibleIndicesBuffer!,
+            _occluderOffsetsBuffer!, _occluderIndicesBuffer!,
+            _segmentOffsetsBuffer!, _segmentIndicesBuffer!,
             Width, Height, SliceCount, SubRays,
+            (Width + ScreenTiling.TileSize - 1) / ScreenTiling.TileSize, ScreenTiling.TileSize,
             ViewHeight / Height, camera.Focal, MinW, sliceWidth, camera.Near, SegmentWScale, footprintK);
         _device.For(Width * Height, voxelShader);
     }
@@ -167,35 +214,26 @@ public class GpuRaycastRenderer(int width, int height, int slices = 64, int subR
     }
 
     /// <summary>
-    /// Converts tetrahedra to the GPU layout, computing angular bounds for X, Y and ana-kata.
+    /// Converts tetrahedra to the GPU layout, attaching the angular ana-kata bounds.
     /// </summary>
-    private static GpuTetrahedron[] ToGpu(List<Tetrahedron> source, float focal) =>
+    private static GpuTetrahedron[] ToGpu(List<Tetrahedron> source, AngularRanges[] ranges) =>
         [
-            .. source.Select(t =>
+            .. source.Select((t, i) => new GpuTetrahedron
             {
-                AngularRanges r = AngularRanges.Compute(t, focal);
-                return new GpuTetrahedron
-                {
-                    A = t.A, B = t.B, C = t.C, D = t.D,
-                    MinW = r.W.Min, MaxW = r.W.Max, MinX = r.X.Min, MaxX = r.X.Max, MinY = r.Y.Min, MaxY = r.Y.Max,
-                };
+                A = t.A, B = t.B, C = t.C, D = t.D,
+                MinW = ranges[i].W.Min, MaxW = ranges[i].W.Max,
             }),
         ];
 
     /// <summary>
-    /// Converts segments to the GPU layout, computing angular bounds for X, Y and ana-kata,
-    /// expanded by the radius footprint.
+    /// Converts segments to the GPU layout, attaching the angular ana-kata bounds.
     /// </summary>
-    private static GpuSegment[] ToGpu(List<Segment4> source, float focal) =>
+    private static GpuSegment[] ToGpu(List<Segment4> source, AngularRanges[] ranges) =>
         [
-            .. source.Select(s =>
+            .. source.Select((s, i) => new GpuSegment
             {
-                AngularRanges r = AngularRanges.ComputeWithRadius(s, focal);
-                return new GpuSegment
-                {
-                    Start = s.Start, End = s.End, Radius = s.Radius,
-                    MinW = r.W.Min, MaxW = r.W.Max, MinX = r.X.Min, MaxX = r.X.Max, MinY = r.Y.Min, MaxY = r.Y.Max,
-                };
+                Start = s.Start, End = s.End, Radius = s.Radius,
+                MinW = ranges[i].W.Min, MaxW = ranges[i].W.Max,
             }),
         ];
 }

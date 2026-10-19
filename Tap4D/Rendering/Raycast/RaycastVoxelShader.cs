@@ -3,9 +3,10 @@ using ComputeSharp;
 namespace Tap4D.Rendering.Raycast;
 
 /// <summary>
-/// Pass 1 of the raycasting renderer: one thread per voxel of the virtual screen.
-/// Casts the voxel's sub-rays and records the voxel state into the depth buffer
-/// (0 = empty, &gt; 0 = nearest hit depth) and the coverage buffer.
+/// Pass 1 of the raycasting renderer: one thread per screen pixel, looping over the
+/// ana-kata slices. Casts the voxel's sub-rays over the candidates of the pixel's
+/// screen tile and records the voxel state into the depth buffer (0 = empty,
+/// &gt; 0 = nearest hit depth) and the coverage buffer.
 /// </summary>
 /// <remarks>
 /// Creates the shader with all captured values.
@@ -18,8 +19,13 @@ public readonly partial struct RaycastVoxelShader(
     ReadOnlyBuffer<GpuSegment> segments,
     ReadWriteBuffer<float> depths,
     ReadWriteBuffer<float> coverage,
-    int visibleCount, int occluderCount, int segmentCount,
-    int width, int height, int sliceCount, int subRays,
+    ReadOnlyBuffer<int> visibleOffsets,
+    ReadOnlyBuffer<int> visibleIndices,
+    ReadOnlyBuffer<int> occluderOffsets,
+    ReadOnlyBuffer<int> occluderIndices,
+    ReadOnlyBuffer<int> segmentOffsets,
+    ReadOnlyBuffer<int> segmentIndices,
+    int width, int height, int sliceCount, int subRays, int tilesX, int tileSize,
     float scale, float focal, float minW, float sliceWidth, float near, float segmentWScale, float footprintK) : IComputeShader
 {
     private const float Epsilon = 1e-12f;
@@ -33,13 +39,18 @@ public readonly partial struct RaycastVoxelShader(
     private readonly ReadOnlyBuffer<GpuSegment> segments = segments;
     private readonly ReadWriteBuffer<float> depths = depths;
     private readonly ReadWriteBuffer<float> coverage = coverage;
-    private readonly int visibleCount = visibleCount;
-    private readonly int occluderCount = occluderCount;
-    private readonly int segmentCount = segmentCount;
+    private readonly ReadOnlyBuffer<int> visibleOffsets = visibleOffsets;
+    private readonly ReadOnlyBuffer<int> visibleIndices = visibleIndices;
+    private readonly ReadOnlyBuffer<int> occluderOffsets = occluderOffsets;
+    private readonly ReadOnlyBuffer<int> occluderIndices = occluderIndices;
+    private readonly ReadOnlyBuffer<int> segmentOffsets = segmentOffsets;
+    private readonly ReadOnlyBuffer<int> segmentIndices = segmentIndices;
     private readonly int width = width;
     private readonly int height = height;
     private readonly int sliceCount = sliceCount;
     private readonly int subRays = subRays;
+    private readonly int tilesX = tilesX;
+    private readonly int tileSize = tileSize;
     private readonly float scale = scale;
     private readonly float focal = focal;
     private readonly float minW = minW;
@@ -50,65 +61,24 @@ public readonly partial struct RaycastVoxelShader(
     /// Casts the sub-rays of all slices of one pixel and records the voxel states.
     /// Dispatched 1D over pixels: the voxel count exceeds the 65535-groups limit,
     /// and each thread loops over the ana-kata slices instead.
-    /// The X/Y culling is done once per pixel, packed into bitmasks; the per-slice
-    /// loop then only checks a mask bit and the ana-kata range.
+    /// The X/Y culling is done by the screen tiling built on the CPU; the per-slice
+    /// loop only checks the ana-kata range of each tile candidate.
     /// </summary>
     public void Execute()
     {
         int pixel = ThreadIds.X;
         float pixelX = ((pixel % width) + 0.5f - width / 2f) * scale;
         float pixelY = (height / 2f - (pixel / width) - 0.5f) * scale;
-        float half = scale * 0.5f + CullMargin;
-        uint visLo = 0, visHi = 0, occLo = 0, occHi = 0, seg = 0;
-        for (int i = 0; i < visibleCount; i++)
-            if (OverlapsXY(visibleTetrahedra[i], pixelX, pixelY, half))
-                SetBit(ref visLo, ref visHi, i);
-        for (int i = 0; i < occluderCount; i++)
-            if (OverlapsXY(occluderTetrahedra[i], pixelX, pixelY, half))
-                SetBit(ref occLo, ref occHi, i);
-        for (int i = 0; i < segmentCount; i++)
-            if (OverlapsXY(segments[i], pixelX, pixelY, half))
-                seg |= 1u << i;
+        int tile = (pixel / width / tileSize) * tilesX + (pixel % width) / tileSize;
         for (int slice = 0; slice < sliceCount; slice++)
-            CastSlice(pixel, pixelX, pixelY, slice, visLo, visHi, occLo, occHi, seg);
+            CastSlice(pixel, pixelX, pixelY, tile, slice);
     }
 
     /// <summary>
-    /// Sets the bit for a primitive index in a 64-bit mask passed as two 32-bit halves.
+    /// Casts the sub-rays of one voxel and records its state. Tile candidates whose
+    /// angular ana-kata range does not overlap the slice are skipped.
     /// </summary>
-    private static void SetBit(ref uint lo, ref uint hi, int i)
-    {
-        if (i < 32)
-            lo |= 1u << i;
-        else
-            hi |= 1u << (i - 32);
-    }
-
-    /// <summary>
-    /// Checks a primitive index in a 64-bit mask passed as two 32-bit halves.
-    /// </summary>
-    private static bool HasBit(uint lo, uint hi, int i) =>
-        (i < 32 ? lo & (1u << i) : hi & (1u << (i - 32))) != 0;
-
-    /// <summary>
-    /// Checks whether a primitive's X/Y angular bounds overlap the pixel's footprint.
-    /// </summary>
-    private static bool OverlapsXY(GpuTetrahedron t, float pixelX, float pixelY, float half) =>
-        t.MaxX >= pixelX - half && t.MinX <= pixelX + half
-        && t.MaxY >= pixelY - half && t.MinY <= pixelY + half;
-
-    /// <summary>
-    /// Checks whether a segment's X/Y angular bounds overlap the pixel's footprint.
-    /// </summary>
-    private static bool OverlapsXY(GpuSegment s, float pixelX, float pixelY, float half) =>
-        s.MaxX >= pixelX - half && s.MinX <= pixelX + half
-        && s.MaxY >= pixelY - half && s.MinY <= pixelY + half;
-
-    /// <summary>
-    /// Casts the sub-rays of one voxel and records its state. Primitives whose angular
-    /// ana-kata range does not overlap the slice are skipped.
-    /// </summary>
-    private void CastSlice(int pixel, float pixelX, float pixelY, int slice, uint visLo, uint visHi, uint occLo, uint occHi, uint seg)
+    private void CastSlice(int pixel, float pixelX, float pixelY, int tile, int slice)
     {
         int voxel = pixel * sliceCount + slice;
         float wLo = minW + slice * sliceWidth - CullMargin;
@@ -122,7 +92,7 @@ public readonly partial struct RaycastVoxelShader(
             if (rest <= 0)
                 continue;
             Float4 u = new Float4(pixelX, pixelY, Hlsl.Sqrt(rest), w) / focal;
-            if (Cast(u, wLo, wHi, visLo, visHi, occLo, occHi, seg, out float depth, out bool occluder) && !occluder)
+            if (Cast(u, tile, wLo, wHi, out float depth, out bool occluder) && !occluder)
             {
                 hits++;
                 best = Hlsl.Min(best, depth);
@@ -133,35 +103,44 @@ public readonly partial struct RaycastVoxelShader(
     }
 
     /// <summary>
-    /// Finds the nearest hit along a ray over the primitives selected by the X/Y bitmask
-    /// and the slice's ana-kata interval; occluders participate but only block.
+    /// Finds the nearest hit along a ray over the tile's candidates overlapping the
+    /// slice's ana-kata interval; occluders participate but only block.
     /// </summary>
-    private bool Cast(Float4 u, float wLo, float wHi, uint visLo, uint visHi, uint occLo, uint occHi, uint seg, out float depth, out bool isOccluder)
+    private bool Cast(Float4 u, int tile, float wLo, float wHi, out float depth, out bool isOccluder)
     {
         depth = float.MaxValue;
         isOccluder = false;
         float d;
-        for (int i = 0; i < visibleCount; i++)
-            if (HasBit(visLo, visHi, i) && visibleTetrahedra[i].MaxW >= wLo && visibleTetrahedra[i].MinW <= wHi
+        for (int k = visibleOffsets[tile]; k < visibleOffsets[tile + 1]; k++)
+        {
+            int i = visibleIndices[k];
+            if (visibleTetrahedra[i].MaxW >= wLo && visibleTetrahedra[i].MinW <= wHi
                 && TryHitTetrahedron(visibleTetrahedra[i], u, out d) && d < depth)
             {
                 depth = d;
                 isOccluder = false;
             }
-        for (int i = 0; i < occluderCount; i++)
-            if (HasBit(occLo, occHi, i) && occluderTetrahedra[i].MaxW >= wLo && occluderTetrahedra[i].MinW <= wHi
+        }
+        for (int k = occluderOffsets[tile]; k < occluderOffsets[tile + 1]; k++)
+        {
+            int i = occluderIndices[k];
+            if (occluderTetrahedra[i].MaxW >= wLo && occluderTetrahedra[i].MinW <= wHi
                 && TryHitTetrahedron(occluderTetrahedra[i], u, out d) && d < depth)
             {
                 depth = d;
                 isOccluder = true;
             }
-        for (int i = 0; i < segmentCount; i++)
-            if ((seg & (1u << i)) != 0 && segments[i].MaxW >= wLo && segments[i].MinW <= wHi
+        }
+        for (int k = segmentOffsets[tile]; k < segmentOffsets[tile + 1]; k++)
+        {
+            int i = segmentIndices[k];
+            if (segments[i].MaxW >= wLo && segments[i].MinW <= wHi
                 && TryHitSegment(segments[i], u, out d) && d < depth)
             {
                 depth = d;
                 isOccluder = false;
             }
+        }
         return depth < float.MaxValue;
     }
 

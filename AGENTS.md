@@ -24,7 +24,8 @@
     у рендерера, не у палитры). Планарные `CpuRenderer`/`GpuRenderer` (+`RasterShader`).
   - `Rendering/Raycast/` — рейкастер: `VoxelScreen` (сферический экран, 64 среза W),
     `RayTetrahedronIntersection` (Крамер 4×4), `RaySegmentIntersection`,
-    `AngularBounds` (отсев по угловым диапазонам X/Y/W), `CpuRaycastRenderer`,
+    `AngularBounds` (угловые диапазоны X/Y/W), `ScreenTiling` (тайловые списки
+    кандидатов по X/Y, строятся на CPU каждый кадр), `CpuRaycastRenderer`,
     `GpuRaycastRenderer` (два прохода: `RaycastVoxelShader` → воксельные буферы
     depths/coverage, `CompositeShader` → чередование срезов).
 - `Tap4D.Tests/` — xUnit; `Snapshots/RenderSnapshotTests` пишет PNG в `snapshots/`
@@ -62,7 +63,12 @@ dotnet test Tap4D.slnx    # 79+ тестов; snapshot-тесты пишут PNG
 ## Подводные камни
 
 - ComputeSharp: локальные массивы в шейдере не поддерживаются; primary-constructor
-  параметры шейдера доступны в теле напрямую (поле не нужно).
+  параметры шейдера доступны в теле напрямую (поле не нужно). `CopyFrom` пустого
+  массива в GPU-буфер падает (нулевой размер) — пустые категории пропускать.
+- Отсев по X/Y в рейкастере — тайловые списки `ScreenTiling` (16×16 px),
+  одинаковые для CPU и GPU; битмасок с лимитом 64/32 примитива больше нет.
+  Маржа тайлов для отрезков покрывает след толстого луча (константа
+  `pixelSize + ½·sliceWidth·wScale` в угловых координатах).
 - Параллелизация тестов отключена (`AssemblyInfo.cs`) — гонка в ComputeSharp
   ConditionalWeakTable.
 - WScript.Shell SendKeys на машине пользователя ненадёжен — не симулировать ввод

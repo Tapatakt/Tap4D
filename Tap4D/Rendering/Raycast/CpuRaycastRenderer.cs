@@ -79,13 +79,17 @@ public class CpuRaycastRenderer(int width, int height, int slices = 64, int subR
         AngularRanges[] occluderRanges = [.. occluders.Select(t => AngularRanges.Compute(t, camera.Focal))];
         AngularRanges[] segmentRanges = [.. segments.Select(s => AngularRanges.ComputeWithRadius(s, camera.Focal))];
         VoxelScreen screen = new(Width, Height, ViewHeight, camera.Focal, SliceCount, MinW, MaxW);
-        float footprintK = (ViewHeight / Height + 0.5f * screen.SliceWidth * SegmentWScale) / camera.Focal;
+        float pixelSize = ViewHeight / Height;
+        float footprintK = (pixelSize + 0.5f * screen.SliceWidth * SegmentWScale) / camera.Focal;
+        ScreenTiling tiling = ScreenTiling.Build(Width, Height, pixelSize,
+            0.5f * pixelSize + CullMargin, 1.5f * pixelSize + 0.5f * screen.SliceWidth * SegmentWScale + CullMargin,
+            visibleRanges, occluderRanges, segmentRanges);
         float[] depths = new float[Width * Height * SliceCount];
         float[] coverage = new float[depths.Length];
         for (int y = 0; y < Height; y++)
             for (int x = 0; x < Width; x++)
                 for (int s = 0; s < SliceCount; s++)
-                    CastVoxel(visible, occluders, segments, visibleRanges, occluderRanges, segmentRanges, screen, x, y, s, camera.Near, footprintK, depths, coverage);
+                    CastVoxel(visible, occluders, segments, visibleRanges, occluderRanges, segmentRanges, tiling, screen, x, y, s, camera.Near, footprintK, depths, coverage);
         byte[] buffer = Composite(screen, depths, coverage);
         _cachedFrame = buffer;
         FrameIndex++;
@@ -95,26 +99,27 @@ public class CpuRaycastRenderer(int width, int height, int slices = 64, int subR
     /// <summary>
     /// Casts the sub-rays of one voxel and records its state: a hit with the nearest
     /// depth and the coverage fraction, or empty (fully blocked rays count as empty).
-    /// Primitives whose angular ana-kata range does not overlap the slice are skipped.
+    /// Candidates come from the pixel's tile; those whose angular ana-kata range
+    /// does not overlap the slice are skipped.
     /// </summary>
     private void CastVoxel(
         List<Tetrahedron> visible, List<Tetrahedron> occluders, List<Segment4> segments,
         AngularRanges[] visibleRanges, AngularRanges[] occluderRanges, AngularRanges[] segmentRanges,
-        VoxelScreen screen, int x, int y, int slice, float near, float footprintK, float[] depths, float[] coverage)
+        ScreenTiling tiling, VoxelScreen screen, int x, int y, int slice, float near, float footprintK, float[] depths, float[] coverage)
     {
         int voxel = (y * Width + x) * SliceCount + slice;
         float wLo = screen.MinW + slice * screen.SliceWidth - CullMargin;
         float wHi = wLo + screen.SliceWidth + 2 * CullMargin;
         float pixelX = screen.PixelX(x);
         float pixelY = screen.PixelY(y);
-        float half = screen.ViewHeight / Height * 0.5f + CullMargin;
+        int tile = (y / ScreenTiling.TileSize) * tiling.TilesX + x / ScreenTiling.TileSize;
         int hits = 0;
         float best = float.MaxValue;
         for (int sub = 0; sub < SubRays; sub++)
         {
             if (!screen.TryGetDirection(pixelX, pixelY, screen.SliceW(slice, sub, SubRays), out Vector4 u))
                 continue;
-            if (Cast(visible, occluders, segments, visibleRanges, occluderRanges, segmentRanges, pixelX, pixelY, half, u, wLo, wHi, near, SegmentWScale, footprintK, out float depth, out bool occluder) && !occluder)
+            if (Cast(visible, occluders, segments, visibleRanges, occluderRanges, segmentRanges, tiling, tile, u, wLo, wHi, near, SegmentWScale, footprintK, out float depth, out bool occluder) && !occluder)
             {
                 hits++;
                 best = MathF.Min(best, depth);
@@ -128,28 +133,37 @@ public class CpuRaycastRenderer(int width, int height, int slices = 64, int subR
     }
 
     /// <summary>
-    /// Finds the nearest hit along a ray over the primitives overlapping the slice's
-    /// ana-kata interval and the pixel's angular footprint; occluders participate but only block.
+    /// Finds the nearest hit along a ray over the tile's candidates overlapping the slice's
+    /// ana-kata interval; occluders participate but only block.
     /// </summary>
     private static bool Cast(
         List<Tetrahedron> visible, List<Tetrahedron> occluders, List<Segment4> segments,
         AngularRanges[] visibleRanges, AngularRanges[] occluderRanges, AngularRanges[] segmentRanges,
-        float pixelX, float pixelY, float half, Vector4 u, float wLo, float wHi, float near, float wScale, float footprintK, out float depth, out bool isOccluder)
+        ScreenTiling tiling, int tile, Vector4 u, float wLo, float wHi, float near, float wScale, float footprintK, out float depth, out bool isOccluder)
     {
         depth = float.MaxValue;
         isOccluder = false;
-        for (int i = 0; i < visible.Count; i++)
-            if (visibleRanges[i].Overlaps(pixelX, pixelY, half, wLo, wHi)
+        for (int k = tiling.VisibleOffsets[tile]; k < tiling.VisibleOffsets[tile + 1]; k++)
+        {
+            int i = tiling.VisibleIndices[k];
+            if (visibleRanges[i].OverlapsW(wLo, wHi)
                 && RayTetrahedronIntersection.TryIntersect(visible[i], u, near, out float d) && d < depth)
                 (depth, isOccluder) = (d, false);
-        for (int i = 0; i < occluders.Count; i++)
-            if (occluderRanges[i].Overlaps(pixelX, pixelY, half, wLo, wHi)
+        }
+        for (int k = tiling.OccluderOffsets[tile]; k < tiling.OccluderOffsets[tile + 1]; k++)
+        {
+            int i = tiling.OccluderIndices[k];
+            if (occluderRanges[i].OverlapsW(wLo, wHi)
                 && RayTetrahedronIntersection.TryIntersect(occluders[i], u, near, out float d) && d < depth)
                 (depth, isOccluder) = (d, true);
-        for (int i = 0; i < segments.Count; i++)
-            if (segmentRanges[i].Overlaps(pixelX, pixelY, half, wLo, wHi)
+        }
+        for (int k = tiling.SegmentOffsets[tile]; k < tiling.SegmentOffsets[tile + 1]; k++)
+        {
+            int i = tiling.SegmentIndices[k];
+            if (segmentRanges[i].OverlapsW(wLo, wHi)
                 && RaySegmentIntersection.TryIntersect(segments[i].Start, segments[i].End, segments[i].Radius, u, near, wScale, footprintK, out float d) && d < depth)
                 (depth, isOccluder) = (d, false);
+        }
         return depth < float.MaxValue;
     }
 

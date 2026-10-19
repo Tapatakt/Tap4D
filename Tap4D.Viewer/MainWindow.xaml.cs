@@ -29,6 +29,7 @@ public partial class MainWindow : Window
     internal Vector4 CameraPositionForTest => _camera.Position;
     private readonly Stopwatch _clock = Stopwatch.StartNew();
     private DemoScene.Mode _mode = DemoScene.Mode.Wireframe;
+    private DemoScene.Layout _layout = DemoScene.Layout.Single;
     private bool _raycast = true;
     private long _lastFrame;
     private int _fpsLastFrameIndex;
@@ -98,7 +99,7 @@ public partial class MainWindow : Window
         float dt = (float)(now - _lastFrame) / Stopwatch.Frequency;
         _lastFrame = now;
         _controller.Update(_camera, dt);
-        byte[] pixels = _renderer.Render(DemoScene.Build(_mode), _camera);
+        byte[] pixels = _renderer.Render(DemoScene.Build(_mode, _layout), _camera);
         _bitmap.WritePixels(new Int32Rect(0, 0, _bitmap.PixelWidth, _bitmap.PixelHeight), pixels, _bitmap.PixelWidth * 4, 0);
         UpdateFps(now);
     }
@@ -115,13 +116,14 @@ public partial class MainWindow : Window
         {
             double fps = (_renderer.FrameIndex - _fpsLastFrameIndex) / elapsed;
             _fpsLastFrameIndex = _renderer.FrameIndex;
-            Title = $"Tap4D Viewer ({_renderer.GetType().Name}, {fps:F0} fps, near={_camera.Near:F3}, z={_camera.Position.Z:F2})";
+            Title = $"Tap4D Viewer ({_renderer.GetType().Name}, {_layout}, {fps:F0} fps, near={_camera.Near:F3}, z={_camera.Position.Z:F2})";
             _fpsWindowStart = now;
         }
     }
 
     /// <summary>
-    /// Handles key presses: M cycles the display mode, P toggles between the planar and
+    /// Handles key presses: M cycles the display mode, N toggles between the single
+    /// tesseract and the 625-tesseract grid, P toggles between the planar and
     /// the raycasting renderer, +/- scale the near plane distance for calibration,
     /// Escape closes the window, the rest go to the camera controller.
     /// </summary>
@@ -129,6 +131,8 @@ public partial class MainWindow : Window
     {
         if (e.Key == Key.M && !e.IsRepeat)
             _mode = (DemoScene.Mode)(((int)_mode + 1) % 3);
+        else if (e.Key == Key.N && !e.IsRepeat)
+            _layout = _layout == DemoScene.Layout.Single ? DemoScene.Layout.Grid625 : DemoScene.Layout.Single;
         else if (e.Key == Key.P && !e.IsRepeat && GpuRenderer.IsAvailable)
         {
             (_renderer as IDisposable)?.Dispose();

@@ -185,11 +185,8 @@ public readonly record struct AngularRanges(
         AngularBounds.RangeForAxisWithRadius(segment, focal, 3));
 
     /// <summary>
-    /// Checks whether the ranges overlap the slice's ana-kata interval and the pixel's
-    /// X/Y footprint.
+    /// Checks whether the ana-kata range overlaps the slice's interval.
+    /// The X/Y culling is done by the screen tiling, so only W is checked here.
     /// </summary>
-    public bool Overlaps(float pixelX, float pixelY, float half, float wLo, float wHi) =>
-        W.Max >= wLo && W.Min <= wHi
-        && X.Max >= pixelX - half && X.Min <= pixelX + half
-        && Y.Max >= pixelY - half && Y.Min <= pixelY + half;
+    public bool OverlapsW(float wLo, float wHi) => W.Max >= wLo && W.Min <= wHi;
 }

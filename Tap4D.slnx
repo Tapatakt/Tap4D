@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Tap4D.Tests/Tap4D.Tests.csproj" />
+  <Project Path="Tap4D.Viewer/Tap4D.Viewer.csproj" />
+  <Project Path="Tap4D/Tap4D.csproj" />
+</Solution>

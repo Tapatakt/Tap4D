@@ -8,10 +8,12 @@ namespace Tap4D.Viewer;
 /// <summary>
 /// First-person camera controller. The Y axis is special: pitch (YZ), roll (XY) and
 /// lean (YW) never affect movement. Orientation composes as
-/// XY(roll) · YW(lean) · YZ(pitch) · XW(wheel) · ZW · XZ(yaw): roll/lean are innermost
-/// (pitch never changes their objective planes), pitch sits inside yaw (mouse up always
-/// looks up), and yaw is outermost (mouse left/right always rotates in the objective
-/// XZ plane). Roll and lean are quick ±45° tilts that spring back when released.
+/// XY(roll) · YW(lean) · YZ(pitch) · [XZ(yaw) · XW(wheel) · ZW]: roll/lean are innermost
+/// (pitch never changes their objective planes), pitch applies before the movement frame
+/// (mouse up always looks up), and yaw is the innermost of the movement frame, so mouse
+/// left/right always turns the view toward screen left/right no matter the XW/ZW state
+/// (with yaw outermost, an XW flip of 180° made mouse look inverted).
+/// Roll and lean are quick ±45° tilts that spring back when released.
 /// </summary>
 internal class FpsCameraController
 {
@@ -130,13 +132,14 @@ internal class FpsCameraController
 
     /// <summary>
     /// Composes the movement frame: the part of the orientation without Y-involving
-    /// rotations, in the same relative order as the full orientation.
+    /// rotations. Yaw applies first (in the camera-local XZ plane), then the wheel XW
+    /// and the ZW rotations follow the heading.
     /// </summary>
     /// <returns>The movement frame matrix.</returns>
     private Matrix4x4 MoveFrame() =>
-        Rotation4.Create(RotationPlane.XW, _wheelXw)
-        * Rotation4.Create(RotationPlane.ZW, _zw)
-        * Rotation4.Create(RotationPlane.XZ, _yaw);
+        Rotation4.Create(RotationPlane.XZ, _yaw)
+        * Rotation4.Create(RotationPlane.XW, _wheelXw)
+        * Rotation4.Create(RotationPlane.ZW, _zw);
 
     /// <summary>
     /// Recomputes the roll target from the roll keys still held.

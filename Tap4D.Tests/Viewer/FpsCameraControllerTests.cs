@@ -39,4 +39,26 @@ public class FpsCameraControllerTests
         controller.Update(camera, 0.1f);
         Assert.Equal(z, camera.Position.Z, 1e-5f);
     }
+
+    /// <summary>
+    /// Verifies that after an XW flip of ~180 degrees a rightward mouse motion still turns
+    /// the view toward screen right (yaw is camera-local, not objective: with the objective
+    /// XZ yaw the XW flip made the mouse look inverted).
+    /// </summary>
+    [Fact]
+    public void MouseTurnsTowardScreenRightAfterXwFlip()
+    {
+        FpsCameraController controller = new();
+        Camera4 camera = new();
+        for (int i = 0; i < 16; i++)
+            controller.OnWheel(120);
+        controller.Update(camera, 0.01f);
+        Vector4 forwardBefore = Vector4.Transform(Vector4.UnitZ, camera.Orientation);
+        Vector4 right = Vector4.Transform(Vector4.UnitX, camera.Orientation);
+        controller.OnMouseDelta(100, 0);
+        controller.Update(camera, 0.01f);
+        Vector4 forwardAfter = Vector4.Transform(Vector4.UnitZ, camera.Orientation);
+        float sideways = Vector4.Dot(forwardAfter - forwardBefore, right);
+        Assert.True(sideways > 0, $"Mouse right must turn toward screen right, sideways={sideways}");
+    }
 }
